@@ -8,17 +8,17 @@ go version go1.10 linux/amd64
 
 # Chapter II: Interfaces
 
-This chapter covers the inner workings of Go's interfaces.
+本章覆盖 GO 的 interface 内部实现。
 
-Specifically, we'll look at:
-- How functions & methods are called at run time.
-- How interfaces are built and what they're made of.
-- How, when and at what cost does dynamic dispatch work.
-- How the empty interface & other special cases differ from their peers.
-- How interface composition works.
-- How and at what cost do type assertions work.
+我们主要关注：
+- 函数和方法在运行时如何被调用。
+- interface 如何构建，其内容如何组成。
+- 动态分发是如何实现的，什么时候进行，并且有什么样的调用成本。
+- 空接口和其它特殊情况有什么异同。
+- 怎么组合 interface 完成工作。
+- 如何进行断言，断言的成本有多高。
 
-As we dig deeper and deeper, we'll also poke at miscellaneous low-level concerns, such as some implementation details of modern CPUs as well as various optimizations techniques used by the Go compiler.
+随着我们越来越深入的挖掘，我们将会研究各种各样的底层知识，比如现代 CPU 的实现细节，Go 编译器的各种优化手段。
 
 ---
 
@@ -55,48 +55,49 @@ As we dig deeper and deeper, we'll also poke at miscellaneous low-level concerns
 
 ---
 
-- *This chapter assumes you're familiar with Go's assembler ([chapter I](../chapter1_assembly_primer/README.md)).*
-- *If and when running into architecture-specific matters, always assume `linux/amd64`.*
-- *We will always work with compiler optimizations **enabled**.*
-- *Quoted text and/or comments always come from the official documentation (including Russ Cox "Function Calls" design document) and/or codebase, unless stated otherwise.*
+- *本章假设你已经对 Go 的汇编器比较熟悉了 ([chapter I](../chapter1_assembly_primer/README.md)).*
+- *当你需要开始研究架构相关的内容时，请假设自己是在使用 `linux/amd64`.*
+- *我们会始终保持编译器优化是 **打开** 状态。*
+- *引用部分和注释内容都来自于官方文档(包括 Russ Cox "Function Call" 设计文档) 以及代码库，除非特别说明。*
 
 ## Function and method calls
 
-As pointed out by Russ Cox in his design document about function calls (listed at the end of this chapter), Go has..:
+正如 Russ Cox 在他函数调用的设计文档所指出的一样(本章最后有链接)，Go 有:
 
-..4 different kinds of functions..:
-> - top-level func
-> - method with value receiver
-> - method with pointer receiver
-> - func literal
+..4 种不同类型的函数..:
+> - 顶级函数
+> - 值 receiver 的方法
+> - 指针 receiver 的方法
+> - 函数字面量
 
-..and 5 different kinds of calls:
-> - direct call of top-level func (`func TopLevel(x int) {}`)
-> - direct call of method with value receiver (`func (Value) M(int) {}`)
-> - direct call of method with pointer receiver (`func (*Pointer) M(int) {}`)
-> - indirect call of method on interface (`type Interface interface { M(int) }`)
-> - indirect call of func value (`var literal = func(x int) {}`)
+..5 种不同类型的调用:
+> - 直接调用顶级函数(`func TopLevel(x int){}`)
+> - 直接调用值 receiver 的方法(`func (Value) M(int) {}`)
+> - 直接调用指针 receiver 的方法(`func (*Pointer) M(int) {}`)
+> - 间接调用接口的方法(`type Interface interface { M(int) }`)
+> - 间接调用函数值(`var literal = func(x int) {}`)
 
-Mixed together, these make up for 10 possible combinations of function and call types:
-> - direct call of top-level func /
-> - direct call of method with value receiver /
-> - direct call of method with pointer receiver /
-> - indirect call of method on interface / containing value with value method
-> - indirect call of method on interface / containing pointer with value method
-> - indirect call of method on interface / containing pointer with pointer method
-> - indirect call of func value / set to top-level func
-> - indirect call of func value / set to value method
-> - indirect call of func value / set to pointer method
-> - indirect call of func value / set to func literal
+混合一下，有 10 种可能的函数以及调用类型组合:
+> - 直接调用顶级函数 /
+> - 直接调用一个值 receiver 的方法 /
+> - 直接调用一个指针 receiver 的方法 /
+> - 间接调用一个 interface 的方法 / 包含有值方法的值
+> - 间接调用一个 interface 的方法 / 包含有值方法的指针
+> - 间接调用一个 interface 的方法 / 包含有指针方法的指针
+> - 间接调用方法值 / 该值等于顶级方法
+> - 间接调用方法值 / 该值等于值方法
+> - 间接调用方法值 / 该值等于指针方法
+> - 间接调用方法值 / 该值等于函数字面量
 >
-> (A slash separates what is known at compile time from what is only found out at run time.)
+> (这里用斜线来分离编译时和运行时才能知道的信息。)
 
-We'll first take a few minutes to review the three kinds of direct calls, then we'll shift our focus towards interfaces and indirect method calls for the rest of this chapter.  
-We won't cover function literals in this chapter, as doing so would first require us to become familiar with the mechanics of closures.. which we'll inevitably do, in due time.
+本章先来复习一下三种直接调用，然后再把注意力转移到 interface 和间接的方法调用上。
+
+本章不会覆盖函数字面量的内容，因为研究这方面的内容需要我们对闭包技术比较熟悉..而了解闭包可能还需要花费更多的时间。
 
 ### Overview of direct calls
 
-Consider the following code ([direct_calls.go](./direct_calls.go)):
+思考一下下面的代码 ([direct_calls.go](./direct_calls.go)):
 ```Go
 //go:noinline
 func Add(a, b int32) int32 { return a + b }
@@ -118,11 +119,11 @@ func main() {
 }
 ```
 
-Let's have a quick look at the code generated for each of those 4 calls.
+看一看这四种调用生成的代码。
 
 **Direct call of a top-level function**
 
-Looking at the assembly output for `Add(10, 32)`:
+看看 `Add(10, 32)` 的汇编输出:
 ```Assembly
 0x0000 TEXT	"".main(SB), $40-0
   ;; ...omitted everything but the actual function call...
@@ -131,22 +132,23 @@ Looking at the assembly output for `Add(10, 32)`:
   0x002f CALL	"".Add(SB)
   ;; ...omitted everything but the actual function call...
 ```
-We see that, as we already knew from chapter I, this translates into a direct jump to a global function symbol in the `.text` section, with the arguments and return values stored on the caller's stack-frame.  
-It's as straightforward as it gets.
+从第一章我们已经知道，函数调用会被翻译成直接跳转指令，目标是 `.text` 段的全局函数符号，参数和返回值会被存储在发起调用者的栈帧上。
 
-Russ Cox wraps it up as such in his document:
+这个过程比较直观。
+
+Russ Cox 在它的文档里这样概括这件事:
 > Direct call of top-level func:
 > A direct call of a top-level func passes all arguments on the stack, expecting results to occupy the successive stack positions.
 
 **Direct call of a method with pointer receiver**
 
-First things first, the receiver is initialized via `adder := Adder{id: 6754}`:
+先说重要的，receiver 是通过 `adder := Adder{id: 6754}` 来初始化的:
 ```Assembly
 0x0034 MOVL	$6754, "".adder+28(SP)
 ```
-*(The extra-space on our stack-frame was pre-allocated as part of the frame-pointer preamble, which we haven't shown here for conciseness.)*
+*(我们栈帧上额外的空间是作为帧指针前导的一部分，被预先分配好的，简洁起见，这里没有展示出来。)*
 
-Then comes the actual method call to `adder.AddPtr(10, 32)`:
+然后是对 `adder.AddPtr(10 32)` 的直接方法调用:
 ```Assembly
 0x0057 LEAQ	"".adder+28(SP), AX	;; move &adder to..
 0x005c MOVQ	AX, (SP)		;; ..the top of the stack (argument #1)
@@ -155,17 +157,18 @@ Then comes the actual method call to `adder.AddPtr(10, 32)`:
 0x006f CALL	"".(*Adder).AddPtr(SB)
 ```
 
-Looking at the assembly output, we can clearly see that a call to a method (whether it has a value or pointer receiver) is almost identical to a function call, the only difference being that the receiver is passed as first argument.  
-In this case, we do so by loading the effective address (`LEAQ`) of `"".adder+28(SP)` at the top of the frame, so that argument #1 becomes `&adder` (if you're a bit confused regarding the semantics of `LEA` vs. `MOV`, you may want to have a look at the links at the end of this chapter for some pointers).
+观察汇编的输出，我们能够清楚地看到对方法的调用(无论 receiver 是值类型还是指针类型)和对函数的调用是相同的，唯一的区别是 receiver 会被当作第一个参数传入。
 
-Note how the compiler encodes the type of the receiver and whether it's a value or pointer directly into the name of the symbol: `"".(*Adder).AddPtr`.
+这种情况下，我们使用 loading the effective address (`LEAQ`) 这条指令来将 `"".adder+28(SP)` 加载到栈帧顶部，所以第一个参数 #1 就变成了 `&adder` (如果你对 `LEA` 和 `MOV` 有一些迷惑，你可能需要看看附录里的资料了)。
+
+同时注意无论 receiver 的类型是值或是指针，编译器是怎么将其编码成符号名:`"".(*Adder).AddPtr` 的。
 
 > Direct call of method:
 > In order to use the same generated code for both an indirect call of a func value and for a direct call, the code generated for a method (both value and pointer receivers) is chosen to have the same calling convention as a top-level function with the receiver as a leading argument.
 
 **Direct call of a method with value receiver**
 
-As we'd expect, using a value receiver yields very similar code as above.  
+如我们所料，当 receiver 是值类型时，生成的代码和上面的类似。
 Consider `adder.AddVal(10, 32)`:
 ```Assembly
 0x003c MOVQ	$42949679714, AX	;; move (10,6754) to..
@@ -174,23 +177,25 @@ Consider `adder.AddVal(10, 32)`:
 0x0052 CALL	"".Adder.AddVal(SB)
 ```
 
-Looks like something a bit trickier is going on here, though: the generated assembly isn't even referencing `"".adder+28(SP)` anywhere, even though that is where our receiver currently resides.  
-So what's really going on here? Well, since the receiver is a value, and since the compiler is able to statically infer that value, it doesn't bother with copying the existing value from its current location (`28(SP)`): instead, it simply creates a new, identical `Adder` value directly on the stack, and merges this operation with the creation of the second argument to save one more instruction in the process.
+不过这里有一点 trick 的地方，生成的汇编代码没有什么地方有对 `"".adder+28(SP)` 的引用，尽管这个地址是我们 receiver 所在的地址位置。
 
-Once again, notice how the symbol name of the method explicitly denotes that it expects a value receiver.
+这是怎么回事呢？因为 receiver 是值类型，且编译器能够通过静态分析推测出其值，这种情况下编译器认为不需要对值从它原来的位置(`28(SP)`)进行拷贝了: 相应的，只要简单的在栈上创建一个新的和 `Adder` 相等的值，把这个操作和传第二个参数的操作进行捆绑，还可以节省一条汇编指令。
+
+再次仔细观察，这个方法的符号名字，显式地指明了它接收的是一个值类型的 receiver。
 
 ### Implicit dereferencing
 
-There's one final call that we haven't looked at yet: `(&adder).AddVal(10, 32)`.  
-In that case, we're using a pointer variable to call a method that instead expects a value receiver. Somehow, Go automagically dereferences our pointer and manages to make the call. How so?
+还有最后一种调用 `(&adder).AddVal(10, 32)`。
 
-How the compiler handles this kind of situation depends on whether or not the receiver being pointed to has escaped to the heap or not.
+这种情况，我们使用了一个指针变量来调用一个期望 receiver 是值类型的方法。Go 魔法般地自动自动帮我们把指针解引用并执行了调用。为什么会这样？
 
-**Case A: The receiver is on the stack**
+编译器如何处理这种情况取决于 receiver 是否逃逸到堆上。
 
-If the receiver is still on the stack and its size is sufficiently small that it can be copied in a few instructions, as is the case here, the compiler simply copies its value over to the top of the stack then does a straightforward method call to `"".Adder.AddVal` (i.e. the one with a value receiver).
+**Case A: receiver 在栈上**
 
-`(&adder).AddVal(10, 32)` thus looks like this in this situation:
+如果 receiver 在栈上，且 receiver 本身很小，这种情况只需要很少的汇编指令就可以将其值拷贝到栈顶然后再对 `"".Adder.AddVal` 进行一次直接的方法调用 (这里指的是值类型的 receiver)。
+
+`(&adder).AddVal(10, 32)` 于是就和下面这种情况很相似了:
 ```Assembly
 0x0074 MOVL	"".adder+28(SP), AX	;; move (i.e. copy) adder (note the MOV instead of a LEA) to..
 0x0078 MOVL	AX, (SP)		;; ..the top of the stack (argument #1)
@@ -199,16 +204,16 @@ If the receiver is still on the stack and its size is sufficiently small that it
 0x008a CALL	"".Adder.AddVal(SB)
 ```
 
-Boring (although efficient). Let's move on to case B.
+case B 尽管比较高效，但研究起来比较烦人。不过还是来看一下吧。
 
-**Case B: The receiver is on the heap**
+**Case B: receiver 在堆上**
 
-If the receiver has escaped to the heap then the compiler has to take a cleverer route: it generates a new method (with a pointer receiver, this time) that wraps `"".Adder.AddVal`, and replaces the original call to `"".Adder.AddVal` (the wrappee) with a call to `"".(*Adder).AddVal` (the wrapper).  
-The wrapper's sole mission, then, is to make sure that the receiver gets properly dereferenced before being passed to the wrappee, and that any arguments and return values involved are properly copied back and forth between the caller and the wrappee.
+receiver 逃逸到堆上的话，编译器需要用更聪明的过程来解决问题了: 先生成一个新方法(该方法 receiver 为指针类型，原始方法 receiver 为值类型)，然后用新方法包装原来的 `"".Adder.AddVal`，然后将对原始方法`"".Adder.AddVal`的调用替换为对新方法 `"".(*Adder).AddVal` 的调用。
+包装方法唯一的任务，就是保证 receiver 被正确的解引用，并将解引用后的值和其它参数以及返回值在原始方法和调用方法之间拷贝来拷贝去。
 
-(*NOTE: In assembly outputs, these wrapper methods are marked as `<autogenerated>`.*)
+(*NOTE: 在汇编输出中，我们生成的这个包装方法都会被标记上 `<autogenerated>`.*)
 
-Here's an annotated listing of the generated wrapper that should hopefully clear things up a bit:
+下面的汇编代码对整个包装方法的过程进行了注释，应该能帮你搞明白这个过程:
 ```Assembly
 0x0000 TEXT	"".(*Adder).AddVal(SB), DUPOK|WRAPPER, $32-24
   ;; ...omitted preambles...
@@ -239,13 +244,15 @@ Here's an annotated listing of the generated wrapper that should hopefully clear
   ;; ...omitted epilogues...
 ```
 
-Obviously, this kind of wrapper can induce quite a bit of overhead considering all the copying that needs to be done in order to pass the arguments back and forth; especially if the wrappee is just a few instructions.  
-Fortunately, in practice, the compiler would have inlined the wrappee directly into the wrapper to amortize these costs (when feasible, at least).
+显然的，这种包装行为会引入一些成本，因为我们需要将参数拷贝来拷贝去；当原始方法的指令比较少时，这种消耗就是值得考量的了。
+幸运的是，实际情况下编译器会将被包装的方法直接内联到包装方法中来避免这些拷贝消耗(在可行的情况下)。
 
-Note the `WRAPPER` directive in the definition of the symbol, which indicates that this method shouldn't appear in backtraces (so as not to confuse the end-user), nor should it be able to recover from panics that might be thrown by the wrappee.
+注意符号定义中的 `WRAPPER` 指令，该指令表明这个方法不应该在 backtraces 中出现(避免干扰用户)，也不能从原始方法的 panic 中 recover。
+
 > WRAPPER: This is a wrapper function and should not count as disabling recover.
 
-The `runtime.panicwrap` function, which throws a panic if the wrapper's receiver is `nil`, is pretty self-explanatory; here's its complete listing for reference ([src/runtime/error.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/error.go#L132-L157)):
+`runtime.panicwrap` 函数，在包装方法的 receiver 是 `nil` 时会 panic，代码浅显易懂；下面是完整的内容 ([src/runtime/error.go]) (https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/error.go#L132-L157)):
+
 ```Go
 // panicwrap generates a panic for a call to a wrapped value method
 // with a nil pointer receiver.
@@ -279,19 +286,19 @@ func panicwrap() {
 }
 ```
 
-That's all for function and method calls, we'll now focus on the main course: interfaces.
+这些就是所有函数和方法的调用方式了，下面我们来研究主菜: interface。
 
 ## Anatomy of an interface
 
 ### Overview of the datastructures
 
-Before we can understand how they work, we first need to build a mental model of the datastructures that make up interfaces and how they're laid out in memory.  
-To that end, we'll have a quick peek into the runtime package to see what an interface actually looks like from the standpoint of the Go implementation.
+开始理解 interface 如何工作之前，我们需要先对组成 interface 的数据结构和其在内存中的布局建立基础的心智模型。
+为了达到目的，我们先对 runtime 包里相关的代码做简单的阅览，从 Go 语言实现的角度上来看看 interface 到底长什么样。
 
-**The `iface` structure**
+**`iface` 结构体**
 
-`iface` is the root type that represents an interface within the runtime ([src/runtime/runtime2.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/runtime2.go#L143-L146)).  
-Its definition goes like this:
+`iface` 是 runtime 中对 interface 进行表示的根类型 ([src/runtime/runtime2.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/runtime2.go#L143-L146))。
+它的定义长这样:
 ```Go
 type iface struct { // 16 bytes on a 64bit arch
     tab  *itab
@@ -299,15 +306,15 @@ type iface struct { // 16 bytes on a 64bit arch
 }
 ```
 
-An interface is thus a very simple structure that maintains 2 pointers:
-- `tab` holds the address of an `itab` object, which embeds the datastructures that describe both the type of the interface as well as the type of the data it points to.
-- `data` is a raw (i.e. `unsafe`) pointer to the value held by the interface.
+一个 interface 就是这样一个非常简单的结构体，内部维护两个指针:
+- `tab` 持有 `itab` 对象的地址，该对象内嵌了描述 interface 类型和其指向的数据类型的数据结构。
+- `data` 是一个 raw (i.e. `unsafe`) pointer，指向 interface 持有的具体的值。
 
-While extremely simple, this definition already gives us some valuable information: since interfaces can only hold pointers, *any concrete value that we wrap into an interface will have to have its address taken*.  
-More often than not, this will result in a heap allocation as the compiler takes the conservative route and forces the receiver to escape.  
-This holds true even for scalar types!
+虽然很简单，不过数据结构的定义已经提供了重要的信息: 由于 interface 只能持有指针，*任何用 interface 包装的具体类型，都会被取其地址*。
+这样多半会导致一次堆上的内存分配，编译器会保守地让 receiver 逃逸。
+即使是标量类型，也不例外！
 
-We can prove that with a few lines of code ([escape.go](./escape.go)):
+只需要几行代码就可以对上述结论进行证明 ([escape.go](./escape.go)):
 ```Go
 type Addifier interface{ Add(a, b int32) int32 }
 
@@ -327,7 +334,7 @@ escape.go:13:10: Addifier(adder) escapes to heap
 # ...
 ```
 
-One could even visualize the resulting heap allocation using a simple benchmark ([escape_test.go](./escape_test.go)):
+这个分配操作还可以直接通过简单的 benchmark 来可视化 ([escape_test.go](./escape_test.go)):
 ```Go
 func BenchmarkDirect(b *testing.B) {
     adder := Adder{id: 6754}
@@ -355,14 +362,14 @@ BenchmarkDirect-8      	2000000000	         1.60 ns/op	       0 B/op	       0 al
 BenchmarkInterface-8   	100000000	         15.0 ns/op	       4 B/op	       1 allocs/op
 ```
 
-We can clearly see how each time we create a new `Addifier` interface and initialize it with our `adder` variable, a heap allocation of `sizeof(Adder)` actually takes place. 
-Later in this chapter, we'll see how even simple scalar types can lead to heap allocations when used with interfaces.
+能够明显地看到每次我们创建新的 `Addifier` 接口并用 `adder` 变量初始化它时，`sizeof(Addr)` 都会发生一次堆内存分配。
+本章晚些时候，我们将会研究简单的标量类型在和 interface 结合时，是如何导致堆内存分配的。
 
-Let's turn our attention towards the next datastructure: `itab`.
+现在先把注意力集中在下一个数据结构上: `itab`。
 
-**The `itab` structure**
+**`itab` 结构**
 
-`itab` is defined thusly ([src/runtime/runtime2.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/runtime2.go#L648-L658)):
+`itab` 是这样定义的 ([src/runtime/runtime2.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/runtime2.go#L648-L658)):
 ```Go
 type itab struct { // 40 bytes on a 64bit arch
     inter *interfacetype
@@ -373,23 +380,23 @@ type itab struct { // 40 bytes on a 64bit arch
 }
 ```
 
-An `itab` is the heart & brain of an interface.  
+`itab` 是 interface 的核心。
 
-First, it embeds a `_type`, which is the internal representation of any Go type within the runtime.  
-A `_type` describes every facets of a type: its name, its characteristics (e.g. size, alignment...), and to some extent, even how it behaves (e.g. comparison, hashing...)!  
-In this instance, the `_type` field describes the type of the value held by the interface, i.e. the value that the `data` pointer points to.
+首先，`itab` 内嵌了 `_type`，`_type` 这个类型是 runtime 对任意 Go 语言类型的内部表示。
+`_type` 类型描述了一个“类型”的每一个方面: 类型名字，特性(e.g. 大小，对齐方式...)，某种程度上类型的行为(e.g. 比较，哈希...) 也包含在内了。
+在这个例子中，`_type` 字段描述了 interface 所持有的值的类型，`data` 指针所指向的值的类型。
 
-Second, we find a pointer to an `interfacetype`, which is merely a wrapper around `_type` with some extra information that are specific to interfaces.  
-As you'd expect, the `inter` field describes the type of the interface itself.
+其次，我们找到了一个指向 `interfacetype` 的指针，这只是一个包装了 `_type` 和额外的与 interface 相关的信息的字段。
+像你所期望的一样，`inter` 字段描述了 interface 本身的类型。
 
-Finally, the `fun` array holds the function pointers that make up the virtual/dispatch table of the interface.  
-Notice the comment that says `// variable sized`, meaning that the size with which this array is declared is *irrelevant*.  
-We'll see later in this chapter that the compiler is responsible for allocating the memory that backs this array, and does so independently of the size indicated here. Likewise, the runtime always accesses this array using raw pointers, thus bounds-checking does not apply here.
+最后，`func` 数组持有组成该 interface 虚(virtual/dispatch)函数表的的函数的指针。
+注意这里的注释中说 `// variable sized` 即“变长”，这表示这里数组所声明的长度是 *非精确*的。
+本章我们就会看到，编译器对该数组的空间分配负责，并且其分配操作所用的大小值和这里表示的大小值是不匹配的。同样的，runtime 会始终使用 raw pointer 来访问这段内存，边界检查在这里不会生效。
 
-**The `_type` structure**
+**`_type` 结构**
 
-As we said above, the `_type` structure gives a complete description of a Go type.  
-It's defined as such ([src/runtime/type.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/type.go#L25-L43)):
+如上所述，`_type` 结构对 Go 的类型给出了完成的描述。
+其定义在 ([src/runtime/type.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/type.go#L25-L43)):
 ```Go
 type _type struct { // 48 bytes on a 64bit arch
     size       uintptr
@@ -409,19 +416,19 @@ type _type struct { // 48 bytes on a 64bit arch
 }
 ```
 
-Thankfully, most of these fields are quite self-explanatory.
+还好这里大多数的字段名字都做到了自解释。
 
-The `nameOff` & `typeOff` types are `int32` offsets into the metadata embedded into the final executable by the linker. This metadata is loaded into `runtime.moduledata` structures at run time ([src/runtime/symtab.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/symtab.go#L352-L393)), which should look fairly similar if you've ever had to look at the content of an ELF file.  
-The runtime provide helpers that implement the necessary logic for following these offsets through the `moduledata` structures, such as e.g. `resolveNameOff` ([src/runtime/type.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/type.go#L168-L196)) and `resolveTypeOff` ([src/runtime/type.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/type.go#L202-L236)):
+`nameOff` 和 `typeOff` 类型是 `int32` ，这两个值是链接器负责嵌入的，相对于可执行文件的元信息的偏移量。元信息会在运行期，加载到 `runtime.moduledata` 结构体中 ([src/runtime/symtab.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/symtab.go#L352-L393)), 如果你曾经研究过 ELF 文件的内容的话，看起来会显得很熟悉。
+runtime 提供了一些 helper 函数，这些函数能够帮你找到相对于 `moduledata` 的偏移量，比如 `resolveNameOff` ([src/runtime/type.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/type.go#L168-L196)) and `resolveTypeOff` ([src/runtime/type.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/type.go#L202-L236)):
 ```Go
 func resolveNameOff(ptrInModule unsafe.Pointer, off nameOff) name {}
 func resolveTypeOff(ptrInModule unsafe.Pointer, off typeOff) *_type {}
 ```
-I.e., assuming `t` is a `_type`, calling `resolveTypeOff(t, t.ptrToThis)` returns a copy of `t`.
+也就是说，假设 `t` 是 `_type` 的话，只要调用 `resolveTypeOff(t, t.ptrToThis) 就可以返回 `t` 的一份拷贝了。
 
-**The `interfacetype` structure**
+**`interfacetype` 结构体**
 
-Finally, here's the `interfacetype` structure ([src/runtime/type.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/type.go#L342-L346)):
+最后是 `interfacetype` 结构体 ([src/runtime/type.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/type.go#L342-L346)):
 ```Go
 type interfacetype struct { // 80 bytes on a 64bit arch
     typ     _type
@@ -435,12 +442,12 @@ type imethod struct {
 }
 ```
 
-As mentionned, an `interfacetype` is just a wrapper around a `_type` with some extra interface-specific metadata added on top.  
-In the current implementation, this metadata is mostly composed of a list of offsets that points to the respective names and types of the methods exposed by the interface (`[]imethod`).
+像之前提过的，`interfacetype` 只是对于 `_type` 的一种包装，在其顶部空间还包装了额外的 interface 相关的元信息。
+在最近的实现中，这部分元信息一般是由一些指向相应名字的 offset 的列表和 interface 所暴露的方法的类型所组成(`[]imethod`)。 
 
-**Conclusion**
+**结论**
 
-Here's an overview of what an `iface` looks like when represented with all of its sub-types inlined; this hopefully should help connect all the dots:
+下面是对 `iface` 的一份总览，我们把所有的子类型都做了展开；这样应该能够更好地帮助我们融会贯通:
 ```Go
 type iface struct { // `iface`
     tab *struct { // `itab`
@@ -485,14 +492,14 @@ type iface struct { // `iface`
 }
 ```
 
-This section glossed over the different data-types that make up an interface to help us to start building a mental model of the various cogs involved in the overall machinery, and how they all work with each other.  
-In the next section, we'll learn how these datastructures actually get computed.
+本小节对组成 interface 的不同的数据类型进行了介绍，使我们建立了接口相关知识的心智模型，并帮我们了解了这些部件如何协同工作。
+在下一节中，我们将会学习这些数据结构如何辅助计算。
 
 ### Creating an interface
 
-Now that we've had a quick look at all the datastructures involved, we'll focus on how they actually get allocated and initiliazed.
+我们已经对 interface 的内部数据结构进行了快速学习，接下来主要聚焦在他们如何被分配以及如何初始化。
 
-Consider the following program ([iface.go](./iface.go)):
+看一下下面的程序 ([iface.go](./iface.go)):
 ```Go
 type Mather interface {
     Add(a, b int32) int32
@@ -516,9 +523,9 @@ func main() {
 }
 ```
 
-*NOTE: For the remainder of this chapter, we will denote an interface `I` that holds a type `T` as `<I,T>`. E.g. `Mather(Adder{id: 6754})` instantiates an `iface<Mather, Adder>`.*
+*NOTE: 本章的剩余部分，我们演示一个持有 `T` 类型内容 `I` 类型的 interface，即 `<I,T>`。比如这里的 `Mather(Adder{id: 6754})` 就实例化了一个 `iface<Mather, Adder>`。
 
-Let's zoom in on the instantiation of `iface<Mather, Adder>`:
+主要聚焦在 `iface<Mather, Adder>` 的实例化:
 ```Go
 m := Mather(Adder{id: 6754})
 ```
@@ -537,37 +544,37 @@ This single line of Go code actually sets off quite a bit of machinery, as the a
 0x0044 MOVQ	24(SP), CX
 ```
 
-As you can see, we've splitted the output into three logical parts.
+像你所看到的，我们将输出划分成了三个逻辑部分。
 
-**Part 1: Allocate the receiver**
+**Part 1: 分配 receiver 的空间**
 
 ```Assembly
 0x001d MOVL	$6754, ""..autotmp_1+36(SP)
 ```
 
-A constant decimal value of `6754`, corresponding to the ID of our `Adder`, is stored at the beginning of the current stack-frame.  
-It's stored there so that the compiler will later be able to reference it by its address; we'll see why in part 3.
+十进制常量 `6754` 对应的是我们 `Adder` 的 ID，被存储在当前栈帧的起始位置。
+之后编译器就可以根据它的存储位置来用地址对其进行引用了；我们会在 part 3 中看到原因。
 
-**Part 2: Set up the itab**
+**Part 2: 创建 itab**
 
 ```Assembly
 0x0025 LEAQ	go.itab."".Adder,"".Mather(SB), AX
 0x002c MOVQ	AX, (SP)
 ```
 
-It looks like the compiler has already created the necessary `itab` for representing our `iface<Mather, Adder>` interface, and made it available to us via a global symbol: `go.itab."".Adder,"".Mather`.  
+看起来编译器已经创建了必要的 `itab` 来表示我们的 `iface<Mather, Adder>` interface，并以全局符号 `go.itab."".Adder,"".Mather` 提供给我们使用。
 
-We're in the process of building an `iface<Mather, Adder>` interface and, in order to do so, we're loading the effective address of this global `go.itab."".Adder,"".Mather` symbol at the top of the current stack-frame.  
-Once again, we'll see why in part 3.
+我们正在执行创建 `iface<Mather, Adder>` interface 的流程中，为了能够完成工作，我们将该全局变量 `go.itab."".Adder,"".Mather` 的地址使用 LEAQ 指令从栈帧顶 load 到 AX 寄存器。
+这段行为的原因我们也会在 part 3 中解释。
 
-Semantically, this gives us something along the lines of the following pseudo-code:
+文法上，我们可以用下面这行伪代码来代替上面的几行代码:
 ```Go
 tab := getSymAddr(`go.itab.main.Adder,main.Mather`).(*itab)
 ```
-That's half of our interface right there!
+到此已经完成了我们 interface 的一半工作了。
 
-Now, while we're at it, let's have a deeper look at that `go.itab."".Adder,"".Mather` symbol.  
-As usual, the `-S` flag of the compiler can tell us a lot:
+我们来更深入地研究一下 `go.itab."".Adder,"".Mather` 这个符号。
+像往常一样，编译器的 `-S` flag 已经告诉了我们很多信息:
 ```
 $ GOOS=linux GOARCH=amd64 go tool compile -S iface.go | grep -A 7 '^go.itab."".Adder,"".Mather'
 go.itab."".Adder,"".Mather SRODATA dupok size=40
@@ -580,28 +587,29 @@ go.itab."".Adder,"".Mather SRODATA dupok size=40
     rel 32+8 t=1 "".(*Adder).Sub+0
 ```
 
-Neat. Let's analyze this piece by piece.
+代码很整洁。我们来一句一句地分析一下。
 
-The first piece declares the symbol and its attributes:
+第一句声明了符号和它的属性:
 ```
 go.itab."".Adder,"".Mather SRODATA dupok size=40
 ```
-As usual, since we're looking directly at the intermediate object file generated by the compiler (i.e. the linker hasn't run yet), symbol names are still missing package names. Nothing new on that front.  
-Other than that, what we've got here is a 40-byte global object symbol that will be stored in the `.rodata` section of our binary.
+和通常一样，由于我们看的是编译器生成的间接目标文件(i.e. 即链接器还没有运行)，符号名还没有把 package 名字填充上。其它的没啥新东西。
+除此之外，我们这里得到的是一个 40-字节的全局对象的符号，该符号将被存到二进制文件的 `.rodata` 段中。
 
-Note the `dupok` directive, which tells the linker that it is legal for this symbol to appear multiple times at link-time: the linker will have to arbitrarily choose one of them over the others.  
-What makes the Go authors think that this symbol might end up duplicated, I'm not sure. Feel free to file an issue if you know more.
+注意这里的 `dupok` 指令，这个指令会告诉链接器如果这个符号在链接期出现多次的话是 ok 的: 链接器将随意选择其中的一个。
+是什么让 Go 的作者们认为这个符号会出现重复，我不是很清楚。如果你了解更多细节的话，欢迎开一个 issue 来讨论。
 
-The second piece is a hexdump of the 40 bytes of data associated with the symbol. I.e., it's a serialized representation of an `itab` structure:
+下面这段代码是和该符号相关的 hexdump 的 40 个字节的数据。也就是说，这是一个 `itab`  结构体被序列化之后的表示方法。
 ```
 0x0000 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
 0x0010 8a 3d 5f 61 00 00 00 00 00 00 00 00 00 00 00 00  .=_a............
 0x0020 00 00 00 00 00 00 00 00                          ........
 ```
-As you can see, most of this data is just a bunch of zeros at this point. The linker will take care of filling them up, as we'll see in a minute.
+如你所见，这部分数据大部分是由 0 组成的。链接器会负责填充这些 0，我们马上就会看到这些是怎么完成的。
 
-Notice how, among all these zeros, 4 bytes actually have been set though, at offset `0x10+4`.  
-If we take a look back at the declaration of the `itab` structure and annotate the respective offsets of its fields:
+注意在这些 0 中，在 offset `0x10+4` 的位置，有 4 个字节的值被设置过了。
+回忆一下 `itab` 结构体的声明，并在在对应的字段上打上注释:
+
 ```Go
 type itab struct { // 40 bytes on a 64bit arch
     inter *interfacetype // offset 0x00 ($00)
@@ -612,9 +620,9 @@ type itab struct { // 40 bytes on a 64bit arch
 			 // offset 0x20 ($32)
 }
 ```
-We see that offset `0x10+4` matches the `hash uint32` field: i.e., the hash value that corresponds to our `main.Adder` type is already right there in our object file.
+可以看到 offset `0x10+4` 和 `hash uint32` 字段是匹配的: 也就是说，对应 `main.Adder` 类型的 hash 值已经在我们的目标文件中了。
 
-The third and final piece lists a bunch of relocation directives for the linker:
+第三即最后一部分列出了提供给链接器的重定向指令:
 ```
 rel 0+8 t=1 type."".Mather+0
 rel 8+8 t=1 type."".Adder+0
@@ -622,11 +630,11 @@ rel 24+8 t=1 "".(*Adder).Add+0
 rel 32+8 t=1 "".(*Adder).Sub+0
 ```
 
-`rel 0+8 t=1 type."".Mather+0` tells the linker to fill up the first 8 bytes (`0+8`) of the contents with the address of the global object symbol `type."".Mather`.  
-`rel 8+8 t=1 type."".Adder+0` then fills the next 8 bytes with the address of `type."".Adder`, and so on and so forth.
+`rel 0+8 t=1 type."".Mather+0` 告诉链接器需要将内容的前 8 个字节(`0+8`) 填充为全局目标符号 `type."".Mather` 的地址。
+`rel 8+8 t=1 type."".Adder+0` 然后用 `type."".Adder` 的地址填充接下来的 8 个字节，之后类似。
 
-Once the linker has done its job and followed all of these directives, our 40-byte serialized `itab` will be complete.  
-Overall, we're now looking at something akin to the following pseudo-code:
+一旦链接器完成了它的工作，执行完了这些指令，40-字节的序列化后的 `itab` 就完成了。
+总体来讲，我们在看的代码类似下面这些伪代码:
 ```Go
 tab := getSymAddr(`go.itab.main.Adder,main.Mather`).(*itab)
 
@@ -642,9 +650,9 @@ tab.fun[0] = getSymAddr(`main.(*Adder).Add`).(uintptr)
 tab.fun[1] = getSymAddr(`main.(*Adder).Sub`).(uintptr)
 ```
 
-We've got ourselves a ready-to-use `itab`, now if we just had some data to along with it, that'd make for a nice, complete interface.
+我们已经得到了一个完整可用的 `itab`，如果能再有一些相关的数据塞进去，就能得到一个完整的更好的 interface 了。
 
-**Part 3: Set up the data**
+**Part 3: 分配数据**
 
 ```Assembly
 0x0030 LEAQ	""..autotmp_1+36(SP), AX
@@ -654,11 +662,11 @@ We've got ourselves a ready-to-use `itab`, now if we just had some data to along
 0x0044 MOVQ	24(SP), CX
 ```
 
-Remember from part 1 that the top of the stack `(SP)` currently holds the address of `go.itab."".Adder,"".Mather` (argument #1).  
-Also remember from part 2 that we had stored a `$6754` decimal constant in `""..autotmp_1+36(SP)`: we now load the effective address of this constant just below the top of the stack-frame, at 8(SP) (argument #2).
+在 part 1 我们说过，现在栈顶`(SP)` 保存着 `go.itab."".Adder."".Mather` 的地址(参数 #1)。
+同时 part 2 我们在 `""..autotmp_1+36(SP)` 位置存储了一个十进制常量 `$6754`: 我们用 8(SP) 来将该栈顶下方的该变量(参数 #2) load 到寄存器中。
 
-These two pointers are the two arguments that we pass into `runtime.convT2I32`, which will apply the final touches of glue to create and return our complete interface.  
-Let's have a closer look at it ([src/runtime/iface.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/iface.go#L433-L451)):
+这两个指针是我们传给 `runtime.convT2I32` 函数的两个参数，该函数将最后的步骤粘起来，创建并返回我们完整的 interface。
+我们再仔细看一下 ([src/runtime/iface.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/iface.go#L433-L451)):
 ```Go
 func convT2I32(tab *itab, elem unsafe.Pointer) (i iface) {
     t := tab._type
@@ -676,16 +684,16 @@ func convT2I32(tab *itab, elem unsafe.Pointer) (i iface) {
 }
 ```
 
-So `runtime.convT2I32` does 4 things:
-1. It creates a new `iface` structure `i` (to be pedantic, its caller creates it.. same difference).
-2. It assigns the `itab` pointer we just gave it to `i.tab`.
-3. It **allocates a new object of type `i.tab._type` on the heap**, then copy the value pointed to by the second argument `elem` into that new object.
-4. It returns the final interface.
+所以 `runtime.convT2I32` 做了 4 件事情:
+1. 它创建了一个 `iface` 的结构体 `i` (这里学究一点的话，是它的 caller 创建的这个结构体..没啥两样)。
+2. 它将我们刚给 `i.tab` 赋的值赋予了 `itab` 指针。
+3. 它 **在堆上分配了一个 `i.tab._type` 的新对象 `i.tab._type`**，然后将第二个参数 `elem` 指向的值拷贝到这个新对象上。
+4. 将最后的 interface 返回。
 
-This process is quite straightforward overall, although the 3rd step does involve some tricky implementation details in this specific case, which are caused by the fact that our `Adder` type is effectively a scalar type.  
-We'll look at the interactions of scalar types and interfaces in more details in the section about [the special cases of interfaces](#interface-holding-a-scalar-type).
+这个过程比较直截了当，尽管第三步在这种特定 case 下包含了一些 tricky 的实现细节，这些麻烦的细节是因为我们的 `Adder` 是一个标量类型。
+我们会在 [the special cases of interfaces](#interface-holding-a-scalar-type) 一节来研究标量类型和 interface 交互的更多细节。
 
-Conceptually, we've now accomplished the following (pseudo-code):
+现在我们已经完成了下面这些工作(伪代码):
 ```Go
 tab := getSymAddr(`go.itab.main.Adder,main.Mather`).(*itab)
 elem := getSymAddr(`""..autotmp_1+36(SP)`).(*int32)
@@ -697,7 +705,7 @@ assert(*(*int32)(i.data) == 6754) // same value..
 assert((*int32)(i.data) != elem)  // ..but different (al)locations!
 ```
 
-To summarize all that just went down, here's a complete, annotated version of the assembly code for all 3 parts:
+总结一下目前所有的内容，这里是一份完整带注释的汇编代码，包含了所有 3 个部分:
 ```Assembly
 0x001d MOVL	$6754, ""..autotmp_1+36(SP)         ;; create an addressable $6754 value at 36(SP)
 0x0025 LEAQ	go.itab."".Adder,"".Mather(SB), AX  ;; set up go.itab."".Adder,"".Mather..
@@ -708,13 +716,13 @@ To summarize all that just went down, here's a complete, annotated version of th
 0x003f MOVQ	16(SP), AX                          ;; AX now holds i.tab (go.itab."".Adder,"".Mather)
 0x0044 MOVQ	24(SP), CX                          ;; CX now holds i.data (&$6754, somewhere on the heap)
 ```
-Keep in mind that all of this started with just one single line: `m := Mather(Adder{id: 6754})`.
+记住，这些代码都是 `m := Mather(Adder{id: 6754})` 这一行代码生成的。
 
-We finally got ourselves a complete, working interface.
+最终，我们得到了完整的，可以工作的 interface。
 
 ### Reconstructing an `itab` from an executable
 
-In the previous section, we dumped the contents of `go.itab."".Adder,"".Mather` directly from the object files generated by the compiler and ended up looking at what was mostly a blob of zeros (except for the `hash` value):
+前一节中，我们从编译器生成的目标文件中 dump 出了 `go.itab."".Adder,"".Mather`，并看到在一串 0 中出现了 hash 值:
 ```
 $ GOOS=linux GOARCH=amd64 go tool compile -S iface.go | grep -A 3 '^go.itab."".Adder,"".Mather'
 go.itab."".Adder,"".Mather SRODATA dupok size=40
@@ -723,14 +731,15 @@ go.itab."".Adder,"".Mather SRODATA dupok size=40
     0x0020 00 00 00 00 00 00 00 00                          ........
 ```
 
-To get a better picture of how the data is laid out into the final executable produced by the linker, we'll walk through the generated ELF file and manually reconstruct the bytes that make up the `itab` of our `iface<Mather, Adder>`.  
-Hopefully, this'll enable us to observe what our `itab` looks like once the linker has done its job.
+为了能更好地理解链接器如何分配这些数据的地址，我们会研究生成的 ELF 文件，并手动重建组成我们的 `iface<Mather, Adder>` 的 `itab` 的数据。
 
-First things first, let's build the `iface` binary: `GOOS=linux GOARCH=amd64 go build -o iface.bin iface.go`.
+这样可以让我们观察 `itab` 在链接器完成工作之后又是长什么样子的。
+
+先来最重要的事情，我们来把 `iface` 编译好: `GOOS=linux GOARCH=amd64 go build -o iface.bin iface.go`。
 
 **Step 1: Find `.rodata`**
 
-Let's print the section headers in search of `.rodata`, `readelf` can help with that:
+我们来打印一下 section 头，以研究 `.rodata` 部分，`readelf` 这个工具可以很方便的完成这件事:
 ```Bash
 $ readelf -St -W iface.bin
 There are 22 section headers, starting at offset 0x190:
@@ -750,7 +759,7 @@ Section Headers:
        [0000000000000002]: ALLOC
 ## ...omitted rest of output...
 ```
-What we really need here is the (decimal) offset of the section, so let's apply some pipe-foo:
+我们现在需要的是 section 中十进制的 offset 值，所以结合 linux 的 pipe 来组合一些命令: 
 ```Bash
 $ readelf -St -W iface.bin | \
   grep -A 1 .rodata | \
@@ -760,17 +769,17 @@ $ readelf -St -W iface.bin | \
 315392
 ```
 
-Which means that `fseek`-ing 315392 bytes into our binary should place us right at the start of the `.rodata` section.  
-Now what we need to do is map this file location to a virtual-memory address.
+这个输出表示 `fseek` 了 315392 个字节才能让我们定位到 `.rodata` section。
+这下我们就只需要将文件文中 map 到虚拟内存地址中了。
 
 **Step 2: Find the virtual-memory address (VMA) of `.rodata`**
 
-The VMA is the virtual address at which the section will be mapped once the binary has been loaded in memory by the OS. I.e., this is the address that we'll use to reference a symbol at runtime.
+VMA 是当我们的二进制文件被 OS load 到内存时，section 被 map 到的虚拟地址。也就是说，这是我们在运行时引用的符号的具体地址。
 
-The reason we care about the VMA in this case is that we cannot directly ask `readelf` or `objdump` for the offset of a specific symbol (AFAIK). What we can do, on the other hand, is ask for the VMA of a specific symbol.  
-Coupled with some simple maths, we should be able to build a mapping between VMAs and offsets and finally find the offsets of the symbols that we're looking for.
+我们关注 VMA，是因为我们没法通过调用 `readelf` 或者 `objdump` 来找到想要的符号的 offset(就我所知)。另一方面，我们想知道的是运行时的符号的虚拟地址。
+只要再进行一些简单的数学运算，我们应该就可以在 VMA 和 offset 之间建立联系，并最终找到我们想要的符号偏移量了。
 
-Finding the VMA of `.rodata` is no different than finding its offset, it's just a different column is all:
+找到 `.rodata` 的 VMA 和寻找它的 offset 没啥区别，只有一列有区别:
 ```Bash
 $ readelf -St -W iface.bin | \
   grep -A 1 .rodata | \
@@ -780,23 +789,23 @@ $ readelf -St -W iface.bin | \
 4509696
 ```
 
-So here's what we know so far: the `.rodata` section is located at offset `$315392` (= `0x04d000`) into the ELF file, which will be mapped at virtual address `$4509696` (= `0x44d000`) at run time.
+我们已知的信息: `.rodata` 段的偏移量是 ELF 文件中的 `$315392`(= `0x04d000`) 位置，该位置会在运行期被映射到虚拟地址 `$4509696`(=`0x44d000`)。
 
-Now we need the VMA as well as the size of the symbol we're looking for:
-- Its VMA will (indirectly) allow us to locate it within the executable.
-- Its size will tell us how much data to extract once we've found the correct offset.
+现在我们需要正在定位的符号的 VMA 和符号的大小:
+- VMA 将(间接)允许我们在可执行文件中间接进行定位。
+- 其大小将让我们知道找到了 offset 之后，需要读多少个字节的数据就能把其数据读出来。
 
 **Step 3: Find the VMA & size of `go.itab.main.Adder,main.Mather`**
 
-`objdump` has those available for us.
+`objdump` 对我们有下面这些用处。
 
-First, find the symbol:
+首先，找到符号:
 ```Bash
 $ objdump -t -j .rodata iface.bin | grep "go.itab.main.Adder,main.Mather"
 0000000000475140 g     O .rodata	0000000000000028 go.itab.main.Adder,main.Mather
 ```
 
-Then, get its VMA in decimal form:
+然后获取到它的十进制形式的虚拟地址:
 ```Bash
 $ objdump -t -j .rodata iface.bin | \
   grep "go.itab.main.Adder,main.Mather" | \
@@ -805,7 +814,7 @@ $ objdump -t -j .rodata iface.bin | \
 4673856
 ```
 
-And finally, get its size in decimal form:
+最后获取到十进制的符号大小:
 ```Bash
 $ objdump -t -j .rodata iface.bin | \
   grep "go.itab.main.Adder,main.Mather" | \
@@ -814,13 +823,14 @@ $ objdump -t -j .rodata iface.bin | \
 40
 ```
 
-So `go.itab.main.Adder,main.Mather` will be mapped at virtual address `$4673856` (= `0x475140`) at run time, and has a size of 40 bytes (which we already knew, as it's the size of an `itab` structure).
+所以 `go.itab.main.Adder,main.Mather` 运行时会被映射到 `$4673856`(=`0x475140`) 这个虚拟地址，并且其大小为 40 个字节(我们之前也知道了，这个就是 `itab` 数据结构的大小)
 
 **Step 4: Find & extract `go.itab.main.Adder,main.Mather`**
 
-We now have all the elements we need in order to locate `go.itab.main.Adder,main.Mather` within our binary.  
+within our binary.  
+现在我们有了研究 `go.itab.main.Adder,main.Mather` 这个符号的所有要素。
 
-Here's a reminder of what we know so far:
+下面是对我们已知信息的备忘:
 ```
 .rodata offset: 0x04d000 == $315392
 .rodata VMA: 0x44d000 == $4509696
@@ -829,10 +839,10 @@ go.itab.main.Adder,main.Mather VMA: 0x475140 == $4673856
 go.itab.main.Adder,main.Mather size: 0x24 = $40
 ```
 
-If `$315392` (`.rodata`'s offset) maps to $4509696 (`.rodata`'s VMA) and `go.itab.main.Adder,main.Mather`'s VMA is `$4673856`, then `go.itab.main.Adder,main.Mather`'s offset within the executable is:  
+如果 `$315392` (`.rodata` 的 offset) 映射到 $4509696 (`.rodata` 的 VMA) 并且 `go.itab.main.Adder,main.Mather` 的 VMA 是 `$4673856`， 然后 `go.itab.main.Adder,main.Mather` 在可执行文件中的的 offset 是:  
 `sym.offset = sym.vma - section.vma + section.offset = $4673856 - $4509696 + $315392 = $479552`.
 
-Now that we know both the offset and size of the data, we can take out good ol' `dd` and extract the raw bytes straight out of the executable:  
+因为我们已经知道了 offset 和数据的大小，我们可以掏出我们的好伙伴 `dd` 来将这些原始字节直接从可执行文件中搞出来:
 ```Bash
 $ dd if=iface.bin of=/dev/stdout bs=1 count=40 skip=479552 2>/dev/null | hexdump
 0000000 bd20 0045 0000 0000 ed40 0045 0000 0000
@@ -841,8 +851,8 @@ $ dd if=iface.bin of=/dev/stdout bs=1 count=40 skip=479552 2>/dev/null | hexdump
 0000028
 ```
 
-This certainly does look like a clear-cut victory.. but is it, really? Maybe we've just dumped 40 totally random, unrelated bytes? Who knows?  
-There's at least one way to be sure: let's compare the type hash found in our binary dump (at offset `0x10+4` -> `0x615f3d8a`) with the one loaded by the runtime ([iface_type_hash.go](./iface_type_hash.go)):
+看起来我们获得了显著的胜利。。不过是真的胜利了么？也许我们只是 dump 出了 40 个随机的字节呢，和我们想要的数据根本无关呢？谁知道呢？
+有一个办法能帮我们确认这件事: 让我们将二进制 dump(offset `0x10+4` -> `0x615f3d8a`) 的 type hash 和 runtime 加载的 ([iface_type_hash.go](./iface_type_hash.go)) 进行对比:
 ```Go
 // simplified definitions of runtime's iface & itab types
 type iface struct {
@@ -865,14 +875,15 @@ func main() {
 }
 ```
 
-It's a match! `fmt.Printf("iface.tab.hash = %#x\n", iface.tab.hash)` gives us `0x615f3d8a`, which corresponds to the value that we've extracted from the contents of the ELF file.
+匹配上了！`fmt.Printf("iface.tab.hash = %#x\n",iface.tab.hash)` 给了我们 `0x615f3d8a` 这个结果，和我们从 ELF 文件了扒出来的内容是一致的。
 
-**Conclusion**
+**结论**
 
-We've reconstructed the complete `itab` for our `iface<Mather, Adder>` interface; it's all there in the executable, just waiting to be used, and already contains all the information that the runtime will need to make the interface behave as we expect.
+我们为 `iface<Mather, Adder>` 接口重建了完整的 `itab` 结构；这个结构就躺在我们的可执行文件里等待被使用，并且已经有了 runtime 使 interface 按照需求工作所需要的一切信息。
 
-Of course, since an `itab` is mostly composed of a bunch of pointers to other datastructures, we'd have to follow the virtual addresses present in the contents that we've extracted via `dd` in order to reconstruct the complete picture.  
-Speaking of pointers, we can now have a clear view of the virtual-table for `iface<Mather, Adder>`; here's an annotated version of the contents of `go.itab.main.Adder,main.Mather`:
+当然，因为 `itab` 大多数时候由一堆指向其它数据结构的指针构成，我们还需要跟踪用 `dd` 扒出来的内容中的虚拟地址才能重建出整个运行图。
+
+提到指针的话，我们现在对 `iface<Mather, Adder>` 的虚表已经有了清晰的认识；这里是 `go.itab.main.Adder,main.Mather` 内容的一份注解版本:
 ```Bash
 $ dd if=iface.bin of=/dev/stdout bs=1 count=40 skip=479552 2>/dev/null | hexdump
 0000000 bd20 0045 0000 0000 ed40 0045 0000 0000
@@ -893,15 +904,15 @@ $ objdump -t -j .text iface.bin | grep 000000000044c350
 000000000044c350 g     F .text	000000000000007f main.(*Adder).Sub
 ```
 
-Without surprise, the virtual table for `iface<Mather, Adder>` holds two method pointers: `main.(*Adder).add` and `main.(*Adder).sub`.  
-Well, actually, this *is* a bit surprising: we've never defined these two methods to have pointer receivers.  
-The compiler has generated these wrapper methods on our behalf (as we've described in the ["Implicit dereferencing" section](#implicit-dereferencing)) because it knows that we're going to need them: since an interface can only hold pointers, and since our `Adder` implementation of said interface only provides methods with value-receivers, we'll have to go through a wrapper at some point if we're going to call either of these methods via the virtual table of the interface.
+毫无意外，`iface<Mather, Adder>` 的虚表持有了两个方法指针: `main.(*Adder).add` 和 `main.(*Adder).sub`。
+好吧，这里*确实*有一点奇怪: 我们从来没有定义过有指针 receiver 的这两个方法。
+编译器代表我们直接生成了这些包装方法(如之前在 ["Implicit dereferencing" section](#implicit-dereferencing) 中描述的)，因为它知道我们会需要这些方法: 因为我们的 `Adder` 实现中只提供了值-receiver 的方法，如果某个时刻，我们通过虚表调用任何一个 interface 中的方法，都会需要这里的包装方法。
 
-This should already give you a pretty good idea of how dynamic dispatch is handled at run time; which is what we will look at in the next section.
+这里应该已经让你对动态 dispatch 在运行期间如何处理，有了初步的不错理解；下一节我们会研究这个问题。
 
 **Bonus**
 
-I've hacked up a generic bash script that you can use to dump the contents of any symbol in any section of an ELF file ([dump_sym.sh](./dump_sym.sh)):
+我写了一个通用的 bash 脚本，可以直接用来 dump 出 ELF 文件中的任何段的任何符号的内容 ([dump_sym.sh](./dump_sym.sh)):
 ```Bash
 # ./dump_sym.sh bin_path section_name sym_name
 $ ./dump_sym.sh iface.bin .rodata go.itab.main.Adder,main.Mather
@@ -912,21 +923,21 @@ go.itab.main.Adder,main.Mather SIZE: 40
 
 0000000 bd20 0045 0000 0000 ed40 0045 0000 0000
 0000010 3d8a 615f 0000 0000 c2d0 0044 0000 0000
-0000020 c350 0044 0000 0000                    
+0000020 c350 0044 0000 0000
 0000028
 ```
 
-I'd imagine there must exist an easier way to do what this script does, maybe some arcane flags or an obscure gem hidden inside the `binutils` distribution.. who knows.  
-If you've got some hints, don't hesitate to say so in the issues.
+按说应该哪里是有什么工具可以提供这个脚本的功能的，可能只要给 `binutils` 里的某个工具传一些诡异的 flag 就可以拿到这些内容。。谁知道呢。
+如果你知道已经有工具提供了这个功能的话，不要犹豫，开 issue 告诉我。
 
 ## Dynamic dispatch
 
-In this section we'll finally cover the main feature of interfaces: dynamic dispatch.  
-Specifically, we'll look at how dynamic dispatch works under the hood, and how much we got to pay for it.
+本节我们终于要讲 interface 最主要的功能了: 动态分发。
+明确一些，我们主要研究动态分发在底层如何工作，并且使用动态分发有什么样的成本。
 
 ### Indirect method call on interface
 
-Let's have a look back at our code from earlier ([iface.go](./iface.go)):
+再回看一下最初的代码 ([iface.go](./iface.go)):
 ```Go
 type Mather interface {
     Add(a, b int32) int32
@@ -944,16 +955,15 @@ func main() {
     m.Add(10, 32)
 }
 ```
+我们对这些代码背后所发生的事情已经有了深入的理解: `iface<Mather, Adder>` interface 如何创建，在可执行文件中如何布局，最终如何被 runtime 加载。
+之后就只剩一件事情还需要琢磨，就是对 `m.Add(10, 32)` 的间接调用会做些什么事情了。
 
-We've already had a deeper look into most of what happens in this piece of code: how the `iface<Mather, Adder>` interface gets created, how it's laid out in the final exectutable, and how it ends up being loaded by the runtime.  
-There's only one thing left for us to look at, and that is the actual indirect method call that follows: `m.Add(10, 32)`.
-
-To refresh our memory, we'll zoom in on both the creation of the interface as well as on the method call itself:
+为了让我们能够回忆起之前学到的内容，我们会同时关注 interface 的创建和方法的调用过程:
 ```Go
 m := Mather(Adder{id: 6754})
 m.Add(10, 32)
 ```
-Thankfully, we already have a fully annotated version of the assembly generated by the instantiation done on the first line (`m := Mather(Adder{id: 6754})`):
+还好我们已经有了第一行实例化 (`m := Mather(Adder{id: 6754})`) 时完整带注释的汇编代码:
 ```Assembly
 ;; m := Mather(Adder{id: 6754})
 0x001d MOVL	$6754, ""..autotmp_1+36(SP)         ;; create an addressable $6754 value at 36(SP)
@@ -965,7 +975,7 @@ Thankfully, we already have a fully annotated version of the assembly generated 
 0x003f MOVQ	16(SP), AX                          ;; AX now holds i.tab (go.itab."".Adder,"".Mather)
 0x0044 MOVQ	24(SP), CX                          ;; CX now holds i.data (&$6754, somewhere on the heap)
 ```
-And now, here's the assembly listing for the indirect method call that follows (`m.Add(10, 32)`):
+接着是对方法间接调用 (`m.Add(10, 32)`)的汇编代码:
 ```Assembly
 ;; m.Add(10, 32)
 0x0049 MOVQ	24(AX), AX
@@ -975,14 +985,15 @@ And now, here's the assembly listing for the indirect method call that follows (
 0x0060 CALL	AX
 ```
 
-With the knowledge accumulated from the previous sections, these few instructions should be straightforward to understand.
+有了之前几小节积累的知识，这些指令对我们来说就很直白了。
 
 ```Assembly
 0x0049 MOVQ	24(AX), AX
 ```
-Once `runtime.convT2I32` has returned, `AX` holds `i.tab`, which as we know is a pointer to an `itab`; and more specifically a pointer to `go.itab."".Adder,"".Mather` in this case.  
-By dereferencing `AX` and offsetting 24 bytes forward, we reach `i.tab.fun`, which corresponds to the first entry of the virtual table.  
-Here's a reminder of what the offset table for `itab` looks like:
+`runtime.convT2I32` 一返回，`AX` 中就包含了 `i.tab` 的指针；更准确地说是指向 `go.itab."".Adder."".Mather` 的指针。
+将 `AX` 解引用，然后向前 offset 24 个字节，我们就可以找到 `i.tab.fun` 的位置了，这个地址对应的是虚表的第一个入口。
+下面的代码帮我们回忆一下 `itab` 长啥样:
+
 ```Go
 type itab struct { // 32 bytes on a 64bit arch
     inter *interfacetype // offset 0x00 ($00)
@@ -994,24 +1005,24 @@ type itab struct { // 32 bytes on a 64bit arch
 }
 ```
 
-As we've seen in the previous section where we've reconstructed the final `itab` directly from the executable, `iface.tab.fun[0]` is a pointer to `main.(*Adder).add`, which is the compiler-generated wrapper-method that wraps our original value-receiver `main.Adder.add` method.
+之前小节中我们通过从可执行文件中重建 `itab` 结构，已经知道了 `iface.tab.fun[0]` 是指向 `main.(*Adder).add` 的指针，这是编译器生成的包装方法，该方法会继而调用我们原始的 `main.Adder.add` 方法。
 
 ```Assembly
 0x004d MOVQ	$137438953482, DX
 0x0057 MOVQ	DX, 8(SP)
 ```
-We store `10` and `32` at the top of the stack, as arguments #2 & #3.
+将 `10`  和 `32` 作为参数 #2 和 #3 存在栈顶。
 
 ```Assembly
 0x005c MOVQ	CX, (SP)
 0x0060 CALL	AX
 ```
-Once `runtime.convT2I32` has returned, `CX` holds `i.data`, which is a pointer to our `Adder` instance.  
-We move this pointer to the top of stack, as argument #1, to satisfy the calling convention: the receiver for a method should always be passed as the first argument.
+`runtime.convT2I32` 一返回， `CX` 寄存器就存了 `i.data`，该指针指向 `Adder` 实例。
+我们将该指针移动到栈顶，作为参数 #1，为了能够满足调用规约: receiver 必须作为方法的第一个参数传入。
 
-Finally, with our stack all set up, we can do the actual call.
+最后，栈建好了，可以执行函数调用了。
 
-We'll close this section with a complete annotated assembly listing of the entire process:
+这里给出完整流程的带注释的汇编代码，作为本节的收尾。
 ```Assembly
 ;; m := Mather(Adder{id: 6754})
 0x001d MOVL	$6754, ""..autotmp_1+36(SP)         ;; create an addressable $6754 value at 36(SP)
@@ -1031,50 +1042,50 @@ We'll close this section with a complete annotated assembly listing of the entir
 0x0060 CALL	AX                                  ;; you know the drill
 ```
 
-We now have a clear picture of the entire machinery required for interfaces and virtual method calls to work.  
-In the next section, we'll measure the actual cost of this machinery, in theory as well as in practice.
+我们对 interface 和虚表的工作所需的所有手段都有了清晰的理解。
+下一节，将会分别从理论和实践角度，对 interface 的使用成本进行评估。
 
 ### Overhead
 
-As we've seen, the implementation of interfaces delegates most of the work on both the compiler and the linker. From a performance standpoint, this is obviously very good news: we effectively want to relieve the runtime from as much work as possible.  
-There do exist some specific cases where instantiating an interface may also require the runtime to get to work (e.g. the `runtime.convT2*` family of functions), though they are not so prevalent in practice.  
-We'll learn more about these edge cases in the [section dedicated to the special cases of interfaces](#special-cases--compiler-tricks). In the meantime, we'll concentrate purely on the overhead of virtual method calls and ignore the one-time costs related to instantiation.
+如我们所见，interface 代理的实现主要是由编译器和链接器组合完成的。从性能的角度来讲，这种行为显然是好消息: runtime 干的活越少越好。
+但还是有一些极端 case，实例化 interface 也需要 runtime 也参与进来(e.g. `runtime.convT2*` 族的函数)，尽管实践上这些函数比较少出现。
+在 [section dedicated to the special cases of interfaces](#special-cases--compiler-tricks) 中我们会知道更多的边缘 case。
+现在我们还是只聚焦在虚方法的调用成本上，忽略掉初始化的那些一次性成本。
 
-Once an interface has been properly instantiated, calling methods on it is nothing more than going through one more layer of indirection compared to the usual statically dispatched call (i.e. dereferencing `itab.fun` at the desired index).  
-As such, one would imagine this process to be virtually free.. and one would be kind of right, but not quite: the theory is a bit tricky, and the reality even trickier still.
+一旦 interface 被正确地实例化了，调用这个 interface 的方法相比于调用静态分发的方法，就只不过是多走一个间接层的问题了(i.e. 解引用 `itab.fun` 数组中对应索引位置的指针)。
+因此，可以假设这个过程基本上没啥消耗。。这种假设是对的，但也不完全对: 理论稍微有一些 tricky，事实还更加 tricky 一些。
 
 #### The theory: quick refresher on modern CPUs
 
-The extra indirection inherent to virtual calls is, in and of itself, effectively free *for as long as it is somewhat predictable from the standpoint of the CPU*.  
-Modern CPUs are very aggressive beasts: they cache aggressively, they aggressively pre-fetch both instructions & data, they pre-execute code aggressively, they even reorder and parallelize it as they see fit.  
-All of this extra work is done whether we want it or not, hence we should always strive not to get in the way of the CPU's efforts to be extra smart, so all of these precious cycles don't go needlessly wasted.
+虚函数调用的这种间接性在*只要从 CPU 的角度来讲是可以预测的话*，其成本就是可以忽略不计的。
+现代 CPU 都是非常激进的怪兽: 他们会非常激进地缓存，激进地对指令和数据进行预取，激进地对代码进行预执行，甚至会在可能的时候将这些指令并行化。
+无论我们是否想要，这些额外的工作都会被完成，因此我们应该不要让自己的程序和 CPU 在这方面的优化背道而驰，以免使 CPU 已经运行过的周期都白白浪费。
 
-This is where virtual method calls can quickly become a problem.
+这就是虚方法调用很快变成麻烦问题的地方。
 
-In the case of a statically dispatched call, the CPU has foreknowledge of the upcoming branch in the program and pre-fetches the necessary instructions accordingly. This makes up for a smooth, transparent transition from one branch of the program to the other as far as performance is concerned.  
-With dynamic dispatch, on the other hand, the CPU cannot know in advance where the program is heading: it all depends on computations whose results are, by definition, not known until run time. To counter-balance this, the CPU applies various algorithms and heuristics in order to guess where the program is going to branch next (i.e. "branch prediction").
+在静态调用的情况下，CPU 实际上可以提前知道即将执行的程序分支，并根据预测将这些分支的指令提前取到。这样能够最大化地利用 CPU 流水线来将程序的分支都提前执行掉。
+而在动态分发的情况下，CPU 没有办法提前知道程序会向哪个方向执行: 因为 interface 的特性，不到运行期，没有办法知道到底要取谁的计算结果。为了平衡这一点，CPU 使用了各种各样的探索和算法以猜出程序即将执行的到底是哪一个分支(i.e. 分支预测)。
 
-If the processor guesses correctly, we can expect a dynamic branch to be almost as efficient as a static one, since the instructions of the landing site have already been pre-fetched into the processor's caches anyway.
+如果处理器猜中了，我们就可以期望动态分发的效率和静态分发差不多，由于执行位置的指令已经都被提前取进了处理器的缓存。
 
-If it gets things wrong, though, things can get a bit rough: first, of course, we'll have to pay for the extra indirection plus the corresponding (slow) load from main memory (i.e. the CPU is effectively stalled) to load the right instructions into the L1i cache. Even worse, we'll have to pay for the price of the CPU backtracking in its own mistakes and flushing its instruction pipeline following the branch misprediction.  
-Another important downside of dynamic dispatch is that it makes inlining impossible by definition: one simply cannot inline what they don't know is coming.
+如果处理器猜错了的话，就比较麻烦了: 首先，我们需要额外的指令，还需要从主存中加载数据(这会使 CPU 完全失速)到 L1i 缓存中。也可能更糟糕，我们需要付出 CPU 因自身的错误预测而 flush 掉它的指令流水线的成本。
+动态分发的另一个缺点是其会使内联从定义上就完全不可能实现了: 都不知道要运行什么东西，自然没有办法内联了。
 
-All in all, it should, at least in theory, be very possible to end up with massive differences in performance between a direct call to an inlined function F, and a call to that same function that couldn't be inlined and had to go through some extra layers of indirection, and maybe even got hit by a branch misprediction on its way.
+总而言之，直接调用内联函数 F 和调用有额外的中间层的这些间接调用，在性能方面，理论上会有很大的差距，甚至还可能触发 CPU 的分支误判。
 
-That's mostly it for the theory.  
-When it comes to modern hardware, though, one should always be wary of the theory.
+这就是从理论上分析出的可能性。讨论现代硬件的话，我们需要知晓上述理论。
 
-Let's measure this stuff.
+让我们来衡量一下这部分成本。
 
 #### The practice: benchmarks
 
-First things first, some information about the CPU we're running on:
+我们运行 benchmark 的 CPU 信息:
 ```Bash
 $ lscpu | sed -nr '/Model name/ s/.*:\s*(.* @ .*)/\1/p'
 Intel(R) Core(TM) i7-7700HQ CPU @ 2.80GHz
 ```
 
-We'll define the interface used for our benchmarks as such ([iface_bench_test.go](./iface_bench_test.go)):
+我们把要进行 benchmark 的 interface 定义成这样 ([iface_bench_test.go](./iface_bench_test.go)):
 ```Go
 type identifier interface {
     idInline() int32
@@ -1091,9 +1102,9 @@ func (id *id32) idInline() int32 { return id.id }
 func (id *id32) idNoInline() int32 { return id.id }
 ```
 
-**Benchmark suite A: single instance, many calls, inlined & non-inlined**
+**Benchmark suite A: 单实例，多次调用，内联 & 非内联**
 
-For our first two benchmarks, we'll try calling a non-inlined method inside a busy-loop, on both an `*Adder` value and a `iface<Mather, *Adder>` interface:
+我们开头的两个 benchmark 会尝试在 busy-loop 中调用非内联方法，一个是 `*Adder` 值，另一个是 `iface<Mather, *Adder>` 的 interface:
 ```Go
 var escapeMePlease *id32
 // escapeToHeap makes sure that `id` escapes to the heap.
@@ -1143,15 +1154,16 @@ func BenchmarkMethodCall_interface(b *testing.B) {
 }
 ```
 
-We expect both benchmarks to run A) extremely fast and B) at almost the same speeds.
+我们期望的结果是，两个 benchmark 在跑 A) 的时候极其快，B) 的速度也差不多。
 
-Given the tightness of the loop, we can expect both benchmarks to have their data (receiver & vtable) and instructions (`"".(*id32).idNoInline`) already be present in the L1d/L1i caches of the CPU for each iteration of the loop. I.e., performance should be purely CPU-bound.
+考虑到 loop 的紧密性，我们可以期望这两个 benchmark 的循环在每次迭代时，都保证其数据(receiver 和虚函数表)和指令(`"".(*id32).idNoInline`)已经在 CPU 的 L1d/L1i 的缓存中了。也就是说，这里的性能可以认为是 CPU-bound。
 
-`BenchmarkMethodCall_interface` should run a bit slower (on the nanosecond scale) though, as it has to deal with the overhead of finding & copying the right pointer from the virtual table (which is already in the L1 cache, though).  
+`BenchmarkMethodCall_interface` 会稍微慢一些(在纳秒级别的评价范围)，因为其需要从虚表(已经在 L1 cache 了)查找并拷贝正确的指针，有一些成本。
 Since the `CALL CX` instruction has a strong dependency on the output of these few extra instructions required to consult the vtable, the processor has no choice but to execute all of this extra logic as a sequential stream, leaving any chance of instruction-level parallelization on the table.  
-This is ultimately the main reason why we would expect the "interface" version to run a bit slower.
 
-We end up with the following results for the "direct" version:
+这是我们会觉得 "interface" 版本运行稍慢的主要原因。
+
+下面是 "直接" 调用版本的结果:
 ```Bash
 $ go test -run=NONE -o iface_bench_test.bin iface_bench_test.go && \
   perf stat --cpu=1 \
@@ -1175,7 +1187,7 @@ BenchmarkMethodCall_direct/single/noinline         	2000000000	         1.80 ns/
 
       11.702332281 seconds time elapsed
 ```
-And here's for the "interface" version:
+下面是 "interface" 的版本:
 ```Bash
 $ go test -run=NONE -o iface_bench_test.bin iface_bench_test.go && \
   perf stat --cpu=1 \
@@ -1200,14 +1212,15 @@ BenchmarkMethodCall_interface/single/noinline         	2000000000	         1.96 
       12.709412950 seconds time elapsed
 ```
 
-The results match our expectations: the "interface" version is indeed a bit slower, with approximately 0.15 extra nanoseconds per iteration, or a ~8% slowdown.  
-8% might sound like a noticeable difference at first, but we have to keep in mind that A) these are nanosecond-scale measurements and B) the method being called does so little work that it magnifies even more the overhead of the call.
+结果与我们的期望是相符的: "interface" 版本确实稍慢一些，每个迭代慢 0.15 纳秒，或者说慢了 ~8%。
+8% 一开始听着还挺吓人，但我们需要知道 A) 这个 benchmark 是纳秒级的评估，并且 B) 这个被调用的方法除了被调用之外没有做任何实质性的工作，从而夸大了这个差距。
 
-Looking at the number of instructions per benchmark, we see that the interface-based version has had to execute for ~14 billion more instructions compared to the "direct" version (`110,979,100,648` vs. `124,467,105,161`), even though both benchmarks were run for `6,000,000,000` (`2,000,000,000\*3`) iterations.  
-As we've mentionned before, the CPU cannot parallelize these extra instructions due to the `CALL` depending on them, which gets reflected quite clearly in the instruction-per-cycle ratio: both benchmarks end up with a similar IPC ratio (`2.54` vs. `2.63`) even though the "interface" version has much more work to do overall.  
-This lack of parallelism piles up to an extra ~3.5 billion CPU cycles for the "interface" version, which is where those extra 0.15ns that we've measured are actually spent.
+观察一下两个 benchmark 的指令数目，我们可以看到基于 interface 的版本比 "直接" 调用的版本多了 ~140 亿条指令(`110,979,100,648` vs. `124,467,105,161`)，即使 benchmark 本身只运行了 `6,000,000,000` (`2,000,000,000\*3`) 次迭代。 
+我们之前提过，CPU 没有办法让这些指令并行化，因为 `CALL` 依赖这些指令，这一点在 “每周期指令比例” 上得到了充分的反映: 两个 benchmark 都得到了相似的 IPC(instruction-per-cycle) 比例，虽然 interface 版本整体上需要干更多的活儿。
 
-Now what happens when we let the compiler inline the method call?
+缺乏并行的结果最终堆积结果就是造成了 interface 版本的额外的 ~35 亿 CPU 循环周期，这也是这额外的 0.15ns 具体消耗在的地方。
+
+如果我们让编译器把这个方法调用内联的话，会发生什么呢？
 
 ```Go
 var myID int32
@@ -1242,12 +1255,12 @@ func BenchmarkMethodCall_interface(b *testing.B) {
 }
 ```
 
-Two things jump out at us:
+两件事情浮现在我们面前:
 - `BenchmarkMethodCall_direct`: Thanks to inlining, the call has been reduced to a simple pair of memory moves.
 - `BenchmarkMethodCall_interface`: Due to dynamic dispatch, the compiler has been unable to inline the call, thus the generated assembly ends up being exactly the same as before.
 
 We won't even bother running `BenchmarkMethodCall_interface` since the code hasn't changed a bit.  
-Let's have a quick look at the "direct" version though:
+我们快速阅览一下"直接"的版本:
 ```Bash
 $ go test -run=NONE -o iface_bench_test.bin iface_bench_test.go && \
   perf stat --cpu=1 \
@@ -1272,12 +1285,12 @@ BenchmarkMethodCall_direct/single/inline         	2000000000	         0.34 ns/op
        2.464386341 seconds time elapsed
 ```
 
-As expected, this runs ridiculously fast now that the overhead of the call is gone.  
-With ~0.34ns per op for the "direct" inlined version, the "interface" version is now ~475% slower, quite a steep drop from the ~8% difference that we've measured earlier with inlining disabled.
+如我所料，运行地飞快，调用的消耗几乎没有了。
+被内联的"直接"调用的版本每次需要 ~0.34ns，“interface” 的版本慢了 ~475%，相比前面的 8% 是断崖般的性能差别。
 
 Notice how, with the branching inherent to the method call now gone, the CPU is able to parallelize and speculatively execute the remaining instructions much more efficiently, reaching an IPC ratio of 4.61.
 
-**Benchmark suite B: many instances, many non-inlined calls, small/big/pseudo-random iterations**
+**Benchmark suite B: 多实例，很多非内联调用，small/big/peseudo-random 迭代**
 
 For this second benchmark suite, we'll look at a more real-world-like situation in which an iterator goes through a slice of objects that all expose a common method and calls it for each object.  
 To better mimic reality, we'll disable inlining, as most methods called this way in a real program would most likely by sufficiently complex not to be inlined by the compiler (YMMV; a good counter-example of this is the `sort.Interface` interface from the standard library).
@@ -1289,7 +1302,7 @@ We'll define 3 similar benchmarks that just differ in the way they access this s
 
 In all three cases, we'll make sure that the array is big enough not to fit entirely in any of the processor's caches in order to simulate (not-so-accurately) a very busy server that's putting a lot of pressure of both its CPU caches and main memory.
 
-Here's a quick recap of the processor's attributes, we'll design the benchmarks accordingly:
+下面是对处理器属性的复述，我们会根据这些信息设计我们的 benchmark:
 ```Bash
 $ lscpu | sed -nr '/Model name/ s/.*:\s*(.* @ .*)/\1/p'
 Intel(R) Core(TM) i7-7700HQ CPU @ 2.80GHz
@@ -1468,15 +1481,15 @@ By now you should have a pretty clear idea of how interfaces work, so we'll try 
 
 ### The empty interface
 
-The datastructure for the empty interface is what you'd intuitively think it would be: an `iface` without an `itab`.  
-There are two reasons for that:
-1. Since the empty interface has no methods, everything related to dynamic dispatch can safely be dropped from the datastructure.
-1. With the virtual table gone, the type of the empty interface itself, not to be confused with the type of the data it holds, is always the same (i.e. we talk about *the* empty interface rather than *an* empty interface).
+空接口的的数据结构和直觉推测差不多:  一个不带 `itab` 的 `eface` 结构。
+这样做有两个原因:
+1. 空接口中没有任何方法，和动态分发相关的东西都可以从数据结构中移除。
+2. 干掉虚表之后，接口本身的类型，这里注意不要和接口中数据的类型混了，始终都是相同的(i.e. 我们说的是 *这个* 空接口而不是 *一个* 空接口)
 
-*NOTE: Similar to the notation we used for `iface`, we'll denote the empty interface holding a type T as `eface<T>`*
+*NOTE: 和前面我们给 `iface` 用的记号差不多，我们把持有 T 类型数据的空接口标记为 `eface<T>`*
 
-`eface` is the root type that represents the empty interface within the runtime ([src/runtime/runtime2.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/runtime2.go#L148-L151)).  
-Its definition goes like this:
+`eface` 是表示 runtime 中空接口的根类型 ([src/runtime/runtime2.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/runtime2.go#L148-L151)).  
+定义差不多是这样:
 ```Go
 type eface struct { // 16 bytes on a 64bit arch
     _type *_type
