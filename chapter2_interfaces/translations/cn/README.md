@@ -251,7 +251,7 @@ receiver 逃逸到堆上的话，编译器需要用更聪明的过程来解决�
 
 > WRAPPER: This is a wrapper function and should not count as disabling recover.
 
-`runtime.panicwrap` 函数，在包装方法的 receiver 是 `nil` 时会 panic，代码浅显易懂；下面是完整的内容 ([src/runtime/error.go]) (https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/error.go#L132-L157)):
+`runtime.panicwrap` 函数，在包装方法的 receiver 是 `nil` 时会 panic，代码浅显易懂；下面是完整的内容 ([src/runtime/error.go](https://github.com/golang/go/blob/bf86aec25972f3a100c3aa58a6abcbcc35bdea49/src/runtime/error.go#L132-L157)):
 
 ```Go
 // panicwrap generates a panic for a call to a wrapped value method
